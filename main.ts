@@ -4,32 +4,40 @@ import { isSafe } from "./src/gameRules.js";
 import { waves, PLAYER_START_ANGLE } from "./src/waves.js";
 import { ORBIT_RADIUS, PLAYER_ARC_HALF_WIDTH } from "./src/config.js";
 
-type Wave = (typeof waves)[number];
+// ORBIT_RADIUS is the maximum orbit radius. On a narrow window the orbit
+// shrinks to fit; wave speed shrinks by the same factor so flight time in
+// seconds stays identical at every window size. Both are recomputed on
+// resize and stored here, so the rest of the code reads one current value.
+let currentRadius: number;
+let scale: number;
 
 interface ScheduledWave {
-  wave: Wave;
+  gapCentre: number;
+  gapHalfWidth: number;
+  speed: number;
   spawnTime: number;
 }
 
 // Arrival time is the running sum of arrivalDelay; spawn time is arrival time
 // minus how long the wave spends travelling from the centre to the orbit.
-function buildSchedule(list: readonly Wave[]): ScheduledWave[] {
+function buildSchedule(radius: number, waveScale: number): ScheduledWave[] {
   let arrivalTime = 0;
-  const schedule = list.map((wave) => {
+  const built = waves.map((wave) => {
     arrivalTime += wave.arrivalDelay;
-    const spawnTime = arrivalTime - ORBIT_RADIUS / wave.speed;
+    const speed = wave.speed * waveScale;
+    const spawnTime = arrivalTime - radius / speed;
     if (spawnTime < 0) {
       throw new Error(
         `wave spawn time is negative (${spawnTime.toFixed(3)}s) --- arrivalDelay/speed produce an impossible wave list`,
       );
     }
-    return { wave, spawnTime };
+    return { gapCentre: wave.gapCentre, gapHalfWidth: wave.gapHalfWidth, speed, spawnTime };
   });
-  schedule.sort((a, b) => a.spawnTime - b.spawnTime);
-  return schedule;
+  built.sort((a, b) => a.spawnTime - b.spawnTime);
+  return built;
 }
 
-const schedule = buildSchedule(waves);
+let schedule: ScheduledWave[];
 
 interface ActiveWave {
   gapCentre: number;
@@ -50,9 +58,15 @@ const ctx: CanvasRenderingContext2D = context;
 function resize(): void {
   canvas.width = window.innerWidth;
   canvas.height = window.innerHeight;
+
+  currentRadius = Math.min(ORBIT_RADIUS, 0.35 * Math.min(canvas.width, canvas.height));
+  scale = currentRadius / ORBIT_RADIUS;
+  schedule = buildSchedule(currentRadius, scale);
+
+  // The schedule changed, so the in-flight run no longer matches it.
+  resetRun();
 }
 window.addEventListener("resize", resize);
-resize();
 
 let playerAngle = PLAYER_START_ANGLE;
 
@@ -66,7 +80,8 @@ const MAX_DELTA = 0.05; // seconds --- caps a backgrounded tab's catch-up jump
 const LOSS_PAUSE = 0.9; // seconds the player dot stays gone before restarting
 
 // The centre form: one radiating line per wave survived, evenly spaced so a
-// full set reads as a complete star. Sized well inside ORBIT_RADIUS.
+// full set reads as a complete star. Sized well inside the orbit radius, and
+// scaled by the same factor so it stays proportionate to the orbit.
 const CENTRE_FORM_INNER_RADIUS = 6;
 const CENTRE_FORM_OUTER_RADIUS = 36;
 const CENTRE_FORM_START_ANGLE = -Math.PI / 2;
@@ -88,7 +103,8 @@ function resetRun(): void {
   resolvedCount = 0;
   lossTimer = 0;
 }
-resetRun();
+
+resize();
 
 function maxVisibleRadius(): number {
   return Math.hypot(canvas.width, canvas.height) / 2 + 50;
@@ -98,11 +114,11 @@ function update(dt: number): void {
   elapsed += dt;
 
   while (nextWaveIndex < schedule.length && schedule[nextWaveIndex].spawnTime <= elapsed) {
-    const { wave } = schedule[nextWaveIndex];
+    const scheduled = schedule[nextWaveIndex];
     active.push({
-      gapCentre: wave.gapCentre,
-      gapHalfWidth: wave.gapHalfWidth,
-      speed: wave.speed,
+      gapCentre: scheduled.gapCentre,
+      gapHalfWidth: scheduled.gapHalfWidth,
+      speed: scheduled.speed,
       radius: 0,
       collisionChecked: false,
     });
@@ -113,7 +129,7 @@ function update(dt: number): void {
     const before = wave.radius;
     wave.radius += wave.speed * dt;
 
-    if (!wave.collisionChecked && before < ORBIT_RADIUS && wave.radius >= ORBIT_RADIUS) {
+    if (!wave.collisionChecked && before < currentRadius && wave.radius >= currentRadius) {
       wave.collisionChecked = true;
       const safe = isSafe(playerAngle, wave.gapCentre, wave.gapHalfWidth - PLAYER_ARC_HALF_WIDTH);
       if (!safe) {
@@ -141,12 +157,15 @@ function drawCentreForm(cx: number, cy: number, count: number, won: boolean): vo
   ctx.lineWidth = won ? 4 : 2;
   ctx.lineCap = "round";
 
+  const innerRadius = CENTRE_FORM_INNER_RADIUS * scale;
+  const outerRadius = CENTRE_FORM_OUTER_RADIUS * scale;
+
   for (let i = 0; i < count; i++) {
     const angle = CENTRE_FORM_START_ANGLE + (i * Math.PI * 2) / waves.length;
-    const x1 = cx + CENTRE_FORM_INNER_RADIUS * Math.cos(angle);
-    const y1 = cy + CENTRE_FORM_INNER_RADIUS * Math.sin(angle);
-    const x2 = cx + CENTRE_FORM_OUTER_RADIUS * Math.cos(angle);
-    const y2 = cy + CENTRE_FORM_OUTER_RADIUS * Math.sin(angle);
+    const x1 = cx + innerRadius * Math.cos(angle);
+    const y1 = cy + innerRadius * Math.sin(angle);
+    const x2 = cx + outerRadius * Math.cos(angle);
+    const y2 = cy + outerRadius * Math.sin(angle);
 
     ctx.beginPath();
     ctx.moveTo(x1, y1);
@@ -167,7 +186,7 @@ function draw(): void {
   ctx.strokeStyle = "#555";
   ctx.lineWidth = 1;
   ctx.beginPath();
-  ctx.arc(cx, cy, ORBIT_RADIUS, 0, Math.PI * 2);
+  ctx.arc(cx, cy, currentRadius, 0, Math.PI * 2);
   ctx.stroke();
 
   ctx.strokeStyle = "white";
@@ -183,8 +202,8 @@ function draw(): void {
   drawCentreForm(cx, cy, resolvedCount, state === "won");
 
   if (state !== "lost") {
-    const px = cx + ORBIT_RADIUS * Math.cos(playerAngle);
-    const py = cy + ORBIT_RADIUS * Math.sin(playerAngle);
+    const px = cx + currentRadius * Math.cos(playerAngle);
+    const py = cy + currentRadius * Math.sin(playerAngle);
     ctx.fillStyle = "white";
     ctx.beginPath();
     ctx.arc(px, py, 6, 0, Math.PI * 2);
