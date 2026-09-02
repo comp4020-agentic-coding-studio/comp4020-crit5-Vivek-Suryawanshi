@@ -20,7 +20,12 @@ interface ScheduledWave {
 
 // Arrival time is the running sum of arrivalDelay; spawn time is arrival time
 // minus how long the wave spends travelling from the centre to the orbit.
-function buildSchedule(radius: number, waveScale: number): ScheduledWave[] {
+//
+// rotationOffset is one angle, picked fresh per run, added to every wave's
+// gapCentre here. Because it is the same number for every wave, the angular
+// distance between any two gaps --- the tuned difficulty --- is unchanged;
+// only where the whole pattern sits on the circle differs run to run.
+function buildSchedule(radius: number, waveScale: number, rotationOffset: number): ScheduledWave[] {
   let arrivalTime = 0;
   const built = waves.map((wave) => {
     arrivalTime += wave.arrivalDelay;
@@ -31,7 +36,12 @@ function buildSchedule(radius: number, waveScale: number): ScheduledWave[] {
         `wave spawn time is negative (${spawnTime.toFixed(3)}s) --- arrivalDelay/speed produce an impossible wave list`,
       );
     }
-    return { gapCentre: wave.gapCentre, gapHalfWidth: wave.gapHalfWidth, speed, spawnTime };
+    return {
+      gapCentre: wave.gapCentre + rotationOffset,
+      gapHalfWidth: wave.gapHalfWidth,
+      speed,
+      spawnTime,
+    };
   });
   built.sort((a, b) => a.spawnTime - b.spawnTime);
   return built;
@@ -123,7 +133,6 @@ function resize(): void {
 
   currentRadius = Math.min(ORBIT_RADIUS, 0.35 * Math.min(canvas.width, canvas.height));
   scale = currentRadius / ORBIT_RADIUS;
-  schedule = buildSchedule(currentRadius, scale);
 
   generateStarfield(canvas.width, canvas.height);
   generateHaze(canvas.width, canvas.height);
@@ -148,13 +157,27 @@ const TRAIL_MAX_AGE = 0.12; // seconds
 let trail: TrailPoint[] = [];
 
 window.addEventListener("pointermove", (event) => {
+  // Once the run has ended, the player's position freezes: a loss hides the
+  // dot entirely, and a win holds it exactly where it stopped.
+  if (state !== "playing") return;
   const cx = canvas.width / 2;
   const cy = canvas.height / 2;
   playerAngle = Math.atan2(event.clientY - cy, event.clientX - cx);
 });
 
+function tryRestart(): void {
+  if (state !== "playing") resetRun();
+}
+window.addEventListener("pointerdown", tryRestart);
+window.addEventListener("keydown", tryRestart);
+
 const MAX_DELTA = 0.05; // seconds --- caps a backgrounded tab's catch-up jump
-const LOSS_PAUSE = 0.9; // seconds the player dot stays gone before restarting
+
+// Seconds after a run ends before the restart symbol starts to fade in, and
+// how long that fade takes. There is no automatic restart any more --- the
+// player ends the wait by clicking, tapping or pressing any key.
+const RESTART_SYMBOL_DELAY = 0.9;
+const RESTART_SYMBOL_FADE = 0.6;
 
 // The centre form: one radiating line per wave survived, evenly spaced so a
 // full set reads as a complete star. Sized well inside the orbit radius, and
@@ -170,7 +193,7 @@ let elapsed: number;
 let nextWaveIndex: number;
 let active: ActiveWave[];
 let resolvedCount: number;
-let lossTimer: number;
+let endTimer: number; // seconds since the run ended (lost or won)
 
 function resetRun(): void {
   state = "playing";
@@ -178,8 +201,11 @@ function resetRun(): void {
   nextWaveIndex = 0;
   active = [];
   resolvedCount = 0;
-  lossTimer = 0;
+  endTimer = 0;
   trail = [];
+
+  const rotationOffset = Math.random() * Math.PI * 2;
+  schedule = buildSchedule(currentRadius, scale, rotationOffset);
 }
 
 resize();
@@ -212,7 +238,7 @@ function update(dt: number): void {
       const safe = isSafe(playerAngle, wave.gapCentre, wave.gapHalfWidth - PLAYER_ARC_HALF_WIDTH);
       if (!safe) {
         state = "lost";
-        lossTimer = 0;
+        endTimer = 0;
         return;
       }
       resolvedCount++;
@@ -383,6 +409,63 @@ function drawPlayer(cx: number, cy: number, t: number): void {
   ctx.fill();
 }
 
+// A circular arrow: an arc plus a small arrowhead at one end, offset below
+// the centre so it never overlaps the centre form above it. Same symbol for
+// a win or a loss --- what differs is what is showing above it. Fades in
+// rather than appearing abruptly, and only once the run has actually ended.
+function drawRestartSymbol(cx: number, cy: number, alpha: number): void {
+  if (alpha <= 0) return;
+
+  const symbolCy = cy + 70 * scale;
+  const radius = 18 * scale;
+  const startAngle = -Math.PI * 0.35;
+  const endAngle = Math.PI * 1.15;
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+
+  ctx.strokeStyle = "rgba(150,190,255,0.35)";
+  ctx.lineWidth = 6 * scale;
+  ctx.beginPath();
+  ctx.arc(cx, symbolCy, radius, startAngle, endAngle);
+  ctx.stroke();
+
+  ctx.strokeStyle = "rgba(225,235,255,0.9)";
+  ctx.lineWidth = 1.5 * scale;
+  ctx.beginPath();
+  ctx.arc(cx, symbolCy, radius, startAngle, endAngle);
+  ctx.stroke();
+
+  // Arrowhead at the arc's end, pointing along the direction of travel.
+  const tipX = cx + radius * Math.cos(endAngle);
+  const tipY = symbolCy + radius * Math.sin(endAngle);
+  const direction = endAngle + Math.PI / 2;
+  const headLength = 7 * scale;
+  const headSpread = 0.5;
+
+  ctx.beginPath();
+  ctx.moveTo(tipX, tipY);
+  ctx.lineTo(
+    tipX + headLength * Math.cos(direction + Math.PI - headSpread),
+    tipY + headLength * Math.sin(direction + Math.PI - headSpread),
+  );
+  ctx.moveTo(tipX, tipY);
+  ctx.lineTo(
+    tipX + headLength * Math.cos(direction + Math.PI + headSpread),
+    tipY + headLength * Math.sin(direction + Math.PI + headSpread),
+  );
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+function restartSymbolAlpha(): number {
+  if (state === "playing") return 0;
+  const sincePause = endTimer - RESTART_SYMBOL_DELAY;
+  if (sincePause <= 0) return 0;
+  return Math.min(1, sincePause / RESTART_SYMBOL_FADE);
+}
+
 function draw(t: number): void {
   const cx = canvas.width / 2;
   const cy = canvas.height / 2;
@@ -400,6 +483,8 @@ function draw(t: number): void {
   if (state !== "lost") {
     drawPlayer(cx, cy, t);
   }
+
+  drawRestartSymbol(cx, cy, restartSymbolAlpha());
 }
 
 let lastTimestamp: number | null = null;
@@ -411,9 +496,8 @@ function frame(timestamp: number): void {
 
   if (state === "playing") {
     update(dt);
-  } else if (state === "lost") {
-    lossTimer += dt;
-    if (lossTimer >= LOSS_PAUSE) resetRun();
+  } else {
+    endTimer += dt;
   }
 
   draw(timestamp / 1000);
